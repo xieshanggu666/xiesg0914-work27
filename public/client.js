@@ -49,6 +49,17 @@
     // 房主在大厅选用后词包内容才作为快照发给服务器，本机列表始终只存在这里。
     get packs() { return JSON.parse(localStorage.getItem('wt_packs') || '[]'); },
     set packs(v) { localStorage.setItem('wt_packs', JSON.stringify(v)); },
+    // 我分享过的词包码（本机映射，见 shares.js）：{code,packId,name,updatedAt}[]。
+    // 服务端才是权威：进词包页时用 myShares 对账（跨设备分享也会出现，取消的码消失）。
+    // 经 globalThis 引用：旧测试桩可能未加载 shares.js，生产环境 <script> 总会先于本文件。
+    get packShares() {
+      const lib = globalThis.WTShares;
+      return lib ? lib.normalizeLocal(JSON.parse(localStorage.getItem('wt_pack_shares') || '[]')) : [];
+    },
+    set packShares(v) {
+      const lib = globalThis.WTShares;
+      if (lib) localStorage.setItem('wt_pack_shares', JSON.stringify(lib.normalizeLocal(v)));
+    },
   };
 
   let ws = null, state = null, prevState = null;
@@ -84,6 +95,7 @@
   const WRITE_TYPES = new Set([
     'createRoom', 'joinRoom', 'spectate', 'setRules', 'setWordPack', 'startGame',
     'play', 'reinforce', 'endTurn', 'challenge', 'resolve',
+    'sharePack', 'unsharePack', 'importShare',
   ]);
 
   function connect() {
@@ -192,6 +204,10 @@
         if (msg.context === 'reconnect') { onReconnectFailed(msg.message); break; }
         // 规则保存失败：编辑器保持打开，错误就地展示
         if (msg.context === 'setRules') onRulesSaveError(msg.message);
+        // 分享/取消/导入失败：错误就地展示在词包页对应入口
+        else if (msg.context === 'sharePack') onShareError(msg.message);
+        else if (msg.context === 'unsharePack') onUnshareError(msg.message);
+        else if (msg.context === 'importShare') onImportError(msg.message);
         else toast(msg.message);
         if (msg.message.includes('会话已失效') || msg.message.includes('房间已不存在')) {
           store.token = null;
@@ -200,6 +216,18 @@
         break;
       case 'rulesSaved':
         onRulesSaved();
+        break;
+      case 'shared':
+        onPackShared(msg);
+        break;
+      case 'unshared':
+        onPackUnshared(msg.code);
+        break;
+      case 'sharedPack':
+        onImportedPack(msg);
+        break;
+      case 'myShares':
+        onMyShares(msg.shares);
         break;
       case 'replay':
         replayFrames = msg.frames; replayIdx = 0;
@@ -1643,46 +1671,263 @@
     renderReview();
   }
 
-  // ---------- 我的词包（纯本地管理；大厅选用时才把内容发给服务器） ----------
+  // ---------- 我的词包（本机管理；分享时词包快照发到服务器，朋友凭码导入） ----------
 
   let editingPackId = null; // null=编辑器关闭；''=新建；否则为正在编辑的词包 id
+  let shareDialogPackId = null; // 分享码弹窗当前对应的词包（null=关闭）；''=更新分享但本机包已删
 
   function openPacks() {
     closePackEditor();
-    renderPacks();
     showScreen('packs');
+    requestMyShares();
+    renderPacks();
+  }
+
+  // 与服务端对账我的分享：以服务端列表为准（跨设备分享的也出现、已取消的消失）。
+  // 离线时 send 返回 false，直接渲染本机缓存即可（不阻塞打开页面）。
+  function requestMyShares() {
+    send({ type: 'myShares', pidSecret: store.pidSecret });
+    if (!$('screen-packs').classList.contains('hidden')) renderPacks();
+  }
+
+  function onMyShares(remote) {
+    store.packShares = WTShares.reconcileLocal(store.packShares, remote);
+    renderPacks();
   }
 
   function renderPacks() {
+    if ($('screen-packs').classList.contains('hidden')) return;
     const packs = store.packs;
+    const myShares = store.packShares;
     $('pack-empty').classList.toggle('hidden', packs.length > 0);
-    $('pack-list').innerHTML = packs.map(p => `
+    $('pack-list').innerHTML = packs.map(p => {
+      const sh = WTShares.findLocalByPackId(myShares, p.id);
+      return `
       <li>
         <div>
-          <div class="pl-title">${esc(p.name)} <span class="badge shield">${p.words.length} 词</span></div>
+          <div class="pl-title">${esc(p.name)} <span class="badge shield">${p.words.length} 词</span>${
+            sh ? `<span class="badge share-badge" data-pack-code="${sh.code}">分享码 ${WTShares.formatCode(sh.code)}</span>` : ''
+          }</div>
           <div class="pl-sub">${p.theme ? esc(p.theme) : '（无主题说明）'}</div>
           <div class="pl-sub">候选词：${p.words.slice(0, 8).map(esc).join('、')}${p.words.length > 8 ? ' …' : ''}</div>
         </div>
         <div class="row">
           <button class="link" data-pack-edit="${p.id}">编辑</button>
+          <button class="link" data-pack-share="${p.id}">${sh ? '分享码' : '分享'}</button>
           <button class="link danger-link" data-pack-del="${p.id}">删除</button>
         </div>
-      </li>`).join('');
+      </li>`;
+    }).join('');
     $('pack-list').querySelectorAll('[data-pack-edit]').forEach(btn => {
       btn.onclick = () => openPackEditor(btn.dataset.packEdit);
+    });
+    $('pack-list').querySelectorAll('[data-pack-share]').forEach(btn => {
+      btn.onclick = () => onPackShareClick(btn.dataset.packShare);
     });
     $('pack-list').querySelectorAll('[data-pack-del]').forEach(btn => {
       btn.onclick = () => {
         const p = WTPacks.find(store.packs, btn.dataset.packDel);
         if (!p) return;
-        if (!confirm(`删除词包「${p.name}」？已选用它的房间不受影响（房间里是快照）。`)) return;
+        const shared = !!WTShares.findLocalByPackId(store.packShares, p.id);
+        const msg = shared
+          ? `删除词包「${p.name}」？已选用它的房间不受影响（房间里是快照）。\n该词包的分享仍对朋友有效，可在页面下方「其他设备上分享的词包」中取消。`
+          : `删除词包「${p.name}」？已选用它的房间不受影响（房间里是快照）。`;
+        if (!confirm(msg)) return;
         store.packs = WTPacks.remove(store.packs, p.id);
         if (editingPackId === p.id) closePackEditor();
         renderPacks();
         toast('词包已删除');
       };
     });
+    renderSharedOrphans();
   }
+
+  // 其他设备分享、或本机词包已删除但服务端仍有效的码：单独列出以便取消。
+  function renderSharedOrphans() {
+    const packIds = new Set(store.packs.map(p => p.id));
+    const orphans = store.packShares.filter(s => !packIds.has(s.packId));
+    const box = $('shared-orphans');
+    box.classList.toggle('hidden', orphans.length === 0);
+    if (!orphans.length) return;
+    $('shared-orphan-list').innerHTML = orphans.map(s => `
+      <li>
+        <div>
+          <div class="pl-title">${esc(s.name || '未命名词包')} <span class="badge shield">分享码 ${WTShares.formatCode(s.code)}</span></div>
+          <div class="pl-sub">本机已无此词包，分享对朋友仍然有效</div>
+        </div>
+        <div class="row">
+          <button class="link" data-orphan-copy="${s.code}">复制码</button>
+          <button class="link danger-link" data-orphan-cancel="${s.code}">取消分享</button>
+        </div>
+      </li>`).join('');
+    $('shared-orphan-list').querySelectorAll('[data-orphan-copy]').forEach(btn => {
+      btn.onclick = () => copyText(WTShares.formatCode(btn.dataset.orphanCopy), '分享码已复制');
+    });
+    $('shared-orphan-list').querySelectorAll('[data-orphan-cancel]').forEach(btn => {
+      btn.onclick = () => confirmUnshare(btn.dataset.orphanCancel, '');
+    });
+  }
+
+  // ---------- 分享 / 取消分享 ----------
+
+  // 列表「分享 / 分享码」：已分享直接打开弹窗（可复制/更新/取消）；未分享则发布。
+  function onPackShareClick(packId) {
+    const p = WTPacks.find(store.packs, packId);
+    if (!p) return;
+    const sh = WTShares.findLocalByPackId(store.packShares, packId);
+    if (sh) { openShareDialog(p, sh.code); return; }
+    shareCurrentPack(p);
+  }
+
+  function shareCurrentPack(p) {
+    // 离线时 send 会统一提示"正在重连"，这里不额外弹"正在生成"，避免两条矛盾提示
+    if (!send({
+      type: 'sharePack', pidSecret: store.pidSecret,
+      pack: { id: p.id, name: p.name, theme: p.theme, words: p.words },
+    })) return;
+    toast('正在生成分享码…');
+  }
+
+  // 服务端确认分享成功（新建或更新）：记下本机映射，弹窗展示码。
+  function onPackShared(msg) {
+    const code = WTShares.normalizeCode(msg.code);
+    if (!WTShares.isValidCode(code)) return;
+    store.packShares = WTShares.upsertLocal(store.packShares,
+      { code, packId: msg.packId, name: msg.name, updatedAt: msg.updatedAt || Date.now() });
+    if (msg.republished) toast('分享内容已更新，朋友导入的始终是最新版本');
+    // 仅当用户仍停留在词包页时弹窗，避免响应到达瞬间已切页而弹窗叠在别的页面上
+    const p = WTPacks.find(store.packs, msg.packId);
+    if (p && !$('dlg-share').open && !$('screen-packs').classList.contains('hidden')) {
+      openShareDialog(p, code);
+    }
+    renderPacks();
+  }
+
+  function onShareError(message) {
+    toast(message);
+  }
+
+  function openShareDialog(p, code) {
+    shareDialogPackId = p ? p.id : '';
+    $('share-title').textContent = p ? `分享词包「${p.name}」` : '分享词包';
+    $('share-code').textContent = WTShares.formatCode(code);
+    $('share-code').dataset.code = code;
+    // 弹窗按钮随当前是否还有本机词包切换（本机包已删时只能取消分享）
+    $('btn-share-update').classList.toggle('hidden', !p);
+    $('share-updated-note').classList.toggle('hidden', !p);
+    openDialog('dlg-share');
+  }
+
+  function confirmUnshare(code, packId) {
+    const c = WTShares.normalizeCode(code);
+    if (!WTShares.isValidCode(c)) return toast('分享码无效');
+    if (!confirm(`取消分享 ${WTShares.formatCode(c)}？取消后该码立即作废，朋友无法再凭它导入（已导入朋友本机的词包不受影响）。`)) return;
+    send({ type: 'unsharePack', pidSecret: store.pidSecret, code: c });
+  }
+
+  function onPackUnshared(code) {
+    const c = WTShares.normalizeCode(code);
+    store.packShares = WTShares.removeLocal(store.packShares, c);
+    if (shareDialogCode() === c) {
+      shareDialogPackId = null;
+      closeDialog('dlg-share');
+    }
+    renderPacks();
+    toast('分享已取消，该码已作废');
+  }
+
+  function onUnshareError(message) {
+    // 服务端已无此码（如其他设备先取消了）：重新拉取列表对账，让本机残留自行消失
+    if (/分享码无效|不是这个分享的作者/.test(message)) requestMyShares();
+    toast(message);
+  }
+
+  const shareDialogCode = () => WTShares.normalizeCode($('share-code').dataset.code || '');
+
+  // 复制到剪贴板：优先 Clipboard API，不可用时退化为选区 + execCommand
+  function copyText(text, okMessage) {
+    const done = () => toast(okMessage || '已复制');
+    const fallback = () => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+        done();
+      } catch { toast(`复制失败，请手动选择：${text}`); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(fallback);
+    } else fallback();
+  }
+
+  $('btn-share-copy').onclick = () => copyText(WTShares.formatCode(shareDialogCode()), '分享码已复制');
+  $('btn-share-update').onclick = () => {
+    const p = WTPacks.find(store.packs, shareDialogPackId);
+    if (!p) return toast('本机已没有这个词包');
+    shareCurrentPack(p);
+  };
+  $('btn-share-cancel').onclick = () => confirmUnshare(shareDialogCode(), shareDialogPackId);
+
+  // ---------- 凭码导入 ----------
+
+  function onImportError(message) {
+    $('err-pack-import').textContent = message;
+  }
+
+  function onImportedPack(msg) {
+    const pack = msg.pack;
+    if (!pack || !Array.isArray(pack.words)) {
+      $('err-pack-import').textContent = '导入的词包数据无效';
+      return;
+    }
+    // 去重 1：同一来源词包（作者 packId）已导入过，直接提示，不产生重复副本
+    const existingBySource = store.packs.find(p => p.importedFrom === pack.id);
+    if (existingBySource) {
+      $('err-pack-import').textContent = '';
+      $('pack-import-code').value = '';
+      toast(`这个词包已经在你的列表里：「${existingBySource.name}」`);
+      return;
+    }
+    // 去重 2：名称与候选词完全相同（不同码的同一内容）也不重复导入
+    const dupContent = store.packs.find(p =>
+      p.name === pack.name && JSON.stringify(p.words) === JSON.stringify(pack.words));
+    if (dupContent) {
+      $('err-pack-import').textContent = '';
+      $('pack-import-code').value = '';
+      toast(`你已经有相同的词包「${dupContent.name}」了`);
+      return;
+    }
+    const { packs, error } = WTPacks.upsert(store.packs, {
+      id: WTPacks.makeId(),
+      name: pack.name, theme: pack.theme, words: pack.words,
+      importedFrom: String(pack.id || ''), importedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    if (error) { $('err-pack-import').textContent = error; return; }
+    store.packs = packs;
+    $('err-pack-import').textContent = '';
+    $('pack-import-code').value = '';
+    renderPacks();
+    toast(`已导入词包「${pack.name}」，建房时可在大厅选用`);
+  }
+
+  $('btn-pack-import').onclick = () => {
+    $('err-pack-import').textContent = '';
+    const code = WTShares.normalizeCode($('pack-import-code').value);
+    if (!WTShares.isValidCode(code)) {
+      $('err-pack-import').textContent = '分享码应为 8 位字母数字（形如 ABCD-EFGH）';
+      return;
+    }
+    send({ type: 'importShare', code });
+  };
+  $('pack-import-code').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('btn-pack-import').onclick();
+  });
 
   function clearPackErrors() {
     for (const id of ['err-pack-name', 'err-pack-theme', 'err-pack-words', 'err-pack-general']) {

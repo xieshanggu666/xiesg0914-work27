@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const game = require('./game');
 const seasonLib = require('./season');
+const sharesLib = require('./public/shares');
 
 const PORT = process.env.PORT || 8080;
 const DATA_DIR = path.join(__dirname, 'data');
@@ -18,6 +19,12 @@ const DATA_FILE = process.env.WT_DATA_FILE
 const SEASON_FILE = process.env.WT_SEASON_FILE
   ? path.resolve(process.env.WT_SEASON_FILE)
   : path.join(DATA_DIR, 'season.json');
+// 词包分享码单独落盘：{ [分享码]: { code,pid,packId,pack 快照,updatedAt } }。
+// 与房间/赛季解耦——分享不依赖任何对局存在，作者取消后码立即作废；
+// 测试可用 WT_SHARES_FILE 指向临时文件。
+const SHARES_FILE = process.env.WT_SHARES_FILE
+  ? path.resolve(process.env.WT_SHARES_FILE)
+  : path.join(DATA_DIR, 'shares.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 // ---------- 赛季战绩存储 ----------
@@ -57,6 +64,39 @@ function flushSeason() {
     fs.mkdirSync(path.dirname(SEASON_FILE), { recursive: true });
     fs.writeFileSync(SEASON_FILE, JSON.stringify(season));
   } catch (e) { console.error('赛季战绩保存失败', e); }
+}
+
+// ---------- 词包分享码存储 ----------
+// 分享与房间/赛季完全解耦：作者把本机词包快照发布到这里拿到 8 位码，
+// 朋友凭码导入；作者（同一 pidSecret 派生出的 pid）可取消，码立即作废。
+let shareStore = sharesLib.emptyShares();
+
+function loadShares() {
+  try {
+    shareStore = sharesLib.normalizeShares(
+      JSON.parse(fs.readFileSync(SHARES_FILE, 'utf8')));
+    console.log(`已恢复词包分享：${Object.keys(shareStore.shares).length} 个分享码`);
+  } catch { /* 首次启动或数据损坏，从空表开始 */ }
+}
+
+let sharesSaveTimer = null;
+function saveShares() {
+  clearTimeout(sharesSaveTimer);
+  sharesSaveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(path.dirname(SHARES_FILE), { recursive: true });
+      fs.writeFileSync(SHARES_FILE, JSON.stringify(shareStore));
+    } catch (e) { console.error('词包分享保存失败', e); }
+  }, 300);
+}
+
+// 停服前立即落盘（与赛季一致，避免最后一个分享还在防抖队列里）
+function flushShares() {
+  clearTimeout(sharesSaveTimer);
+  try {
+    fs.mkdirSync(path.dirname(SHARES_FILE), { recursive: true });
+    fs.writeFileSync(SHARES_FILE, JSON.stringify(shareStore));
+  } catch (e) { console.error('词包分享保存失败', e); }
 }
 
 // ---------- 房间存储 ----------
@@ -274,6 +314,14 @@ function makeRoomCode() {
   return code;
 }
 
+// 词包分享码：8 位、与房间码同一套易读字母表（不含 0/1/I/O），不绑房间；
+// 撞码由 sharesLib.publishForPack 检测后重试，这里只负责随机产出候选码。
+function makeShareCode() {
+  const { CODE_LEN, CODE_ALPHABET } = sharesLib;
+  return Array.from({ length: CODE_LEN },
+    () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
+}
+
 function issueToken(roomCode, playerId, spectator = false) {
   const token = crypto.randomBytes(16).toString('hex');
   tokens.set(token, { roomCode, playerId, spectator });
@@ -454,6 +502,62 @@ const handlers = {
     broadcast(room);
   },
 
+  // 词包分享：作者把本机词包快照存到服务端并拿到 8 位分享码（同一词包重复点分享沿用原码、
+  // 更新快照）。身份与赛季同一道凭据：只认密钥派生出的 pid，取消分享时据此确认是作者本人。
+  sharePack(ws, ctx, msg) {
+    const { pid } = seasonLib.resolvePid(msg);
+    if (!pid) return sendErr(ws, '需要有效的本机身份才能分享词包', 'sharePack');
+    const cleaned = game.sanitizeWordPack(msg.pack);
+    if (typeof cleaned === 'string') return sendErr(ws, cleaned, 'sharePack');
+    const result = sharesLib.publishForPack(shareStore, {
+      pid, packId: cleaned.id, pack: cleaned, generate: makeShareCode,
+    });
+    if (result.error) return sendErr(ws, result.error, 'sharePack');
+    saveShares();
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'shared', code: result.code, packId: cleaned.id,
+        name: cleaned.name, updatedAt: result.updatedAt, republished: result.updated,
+      }));
+    }
+  },
+
+  // 取消分享：只有码的作者（同一 pid）能作废；成功后码立即失效，朋友凭旧码无法再导入。
+  unsharePack(ws, ctx, msg) {
+    const { pid } = seasonLib.resolvePid(msg);
+    if (!pid) return sendErr(ws, '需要有效的本机身份才能取消分享', 'unsharePack');
+    const ok = sharesLib.unpublish(shareStore, msg.code, pid);
+    if (!ok) return sendErr(ws, '分享码无效，或你不是这个分享的作者', 'unsharePack');
+    saveShares();
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'unshared', code: sharesLib.normalizeCode(msg.code) }));
+    }
+  },
+
+  // 朋友凭码导入：只读公开端点，无需加入任何房间；返回的词包不带作者信息、
+  // 带服务端原始 packId，客户端据此生成本机副本并去重。
+  importShare(ws, ctx, msg) {
+    const code = sharesLib.normalizeCode(msg.code);
+    if (!sharesLib.isValidCode(code)) {
+      return sendErr(ws, '分享码应为 8 位字母数字，请检查后重试', 'importShare');
+    }
+    const entry = sharesLib.getShare(shareStore, code);
+    if (!entry) return sendErr(ws, '分享码无效或已被作者取消', 'importShare');
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'sharedPack', code,
+        pack: { id: entry.packId, ...entry.pack } }));
+    }
+  },
+
+  // 我的分享列表（本机身份下全部有效码）：客户端进入「我的词包」时拉取并与本机映射对账，
+  // 跨设备分享的词包也能看到/取消；服务端已取消的码不返回，客户端据此清掉本机残留。
+  myShares(ws, ctx, msg) {
+    const { pid } = seasonLib.resolvePid(msg);
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'myShares', shares: pid ? sharesLib.listByOwner(shareStore, pid) : [] }));
+    }
+  },
+
   startGame(ws, ctx) {
     const room = ctxRoom(ctx);
     if (!room) return;
@@ -594,26 +698,32 @@ const server = http.createServer((req, res) => {
   });
 });
 
-const wss = new WebSocketServer({ server });
-wss.on('connection', (ws) => {
-  const ctx = { playerId: null, roomCode: null };
-  ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-    const h = handlers[msg.type];
-    if (h) {
-      if (SPECTATOR_FORBIDDEN.has(msg.type) && ctx.playerId) {
-        const r0 = rooms.get(ctx.roomCode);
-        if (r0 && game.isSpectator(r0, ctx.playerId)) {
-          return sendErr(ws, '观战者为只读，不能参与对局');
+const wssRef = { current: null };
+function attachWebSocketServer() {
+  // 每次启动创建新的 WebSocketServer：ws 的 close() 会移除 http server 上的 upgrade
+  // 监听器，若复用旧实例，进程内 stop→start 后新连接握手只会拿到 HTTP 200。
+  const wss = new WebSocketServer({ server });
+  wssRef.current = wss;
+  wss.on('connection', (ws) => {
+    const ctx = { playerId: null, roomCode: null };
+    ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
+      const h = handlers[msg.type];
+      if (h) {
+        if (SPECTATOR_FORBIDDEN.has(msg.type) && ctx.playerId) {
+          const r0 = rooms.get(ctx.roomCode);
+          if (r0 && game.isSpectator(r0, ctx.playerId)) {
+            return sendErr(ws, '观战者为只读，不能参与对局');
+          }
         }
+        try { h(ws, ctx, msg); }
+        catch (e) { console.error(e); sendErr(ws, '服务器开小差了，请重试'); }
       }
-      try { h(ws, ctx, msg); }
-      catch (e) { console.error(e); sendErr(ws, '服务器开小差了，请重试'); }
-    }
+    });
+    ws.on('close', () => { if (ctx.playerId) detachSocket(ctx.playerId, ws); });
   });
-  ws.on('close', () => { if (ctx.playerId) detachSocket(ctx.playerId, ws); });
-});
+}
 
 // ---------- 启动 / 停止 ----------
 // 默认直接运行时照常监听 8080；测试可 require 本模块后在临时端口上自启、跑完即停，
@@ -624,7 +734,9 @@ function startServer(port = PORT) {
     // 先恢复赛季战绩：恢复房间时若发现结束房漏记，清理前可兜底补记进赛季
     loadSeason();
     loadRooms();
+    loadShares();
     scheduleRoomPruning();
+    attachWebSocketServer();
     server.listen(port, () => {
       const addr = server.address();
       resolve({ server, port: typeof addr === 'object' && addr ? addr.port : port, stop: stopServer });
@@ -636,16 +748,21 @@ function stopServer() {
   // 停掉所有定时器，避免保存防抖/回合/观战清理等句柄让进程挂住
   clearTimeout(saveTimer);
   clearTimeout(seasonSaveTimer);
+  clearTimeout(sharesSaveTimer);
   for (const t of turnTimers.values()) clearTimeout(t);
   for (const t of spectatorPruneTimers.values()) clearTimeout(t);
   if (roomPruneTimer) clearInterval(roomPruneTimer);
   turnTimers.clear();
   spectatorPruneTimers.clear();
   flushSeason(); // 最后一局战绩可能还在防抖队列里，停服前立即落盘
+  flushShares(); // 最后一个分享同理
+  const wss = wssRef.current;
+  wssRef.current = null;
   return new Promise((resolve) => {
-      wss.close(() => server.close(() => resolve()));
+      const done = () => server.close(() => resolve());
+      if (wss) wss.close(done); else done();
       // wss.close 只等正常关闭；强制终结仍在打开的连接（e2e 里有 ws.close 竞态）
-      for (const client of wss.clients) {
+      if (wss) for (const client of wss.clients) {
         try { client.terminate(); } catch { /* 已关闭 */ }
       }
     });

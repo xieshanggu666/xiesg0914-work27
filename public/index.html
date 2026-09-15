@@ -26,7 +26,7 @@
     <div class="card practice-entry">
       <div>
         <h3>我的词包 <span class="badge shield">本机</span></h3>
-        <p class="hint">围绕一个主题准备起始词候选（如「海洋」「校园」）。建房后房主可在大厅选用词包，所有人开局前都能看到主题与候选词，开局从中不重复抽取起始词。</p>
+        <p class="hint">围绕一个主题准备起始词候选（如「海洋」「校园」）。建房后房主可在大厅选用词包，所有人开局前都能看到主题与候选词，开局从中不重复抽取起始词。点分享生成分享码，朋友凭码就能导入。</p>
       </div>
       <button id="btn-packs-home" class="primary">我的词包</button>
     </div>
@@ -62,12 +62,12 @@
     </div>
   </section>
 
-  <!-- 我的词包：创建 / 编辑 / 删除 -->
+  <!-- 我的词包：创建 / 编辑 / 删除 / 分享 / 凭码导入 -->
   <section id="screen-packs" class="screen hidden">
     <header class="practice-head">
       <button id="btn-packs-back" class="link">← 返回首页</button>
       <h2>我的词包</h2>
-      <p class="hint">词包只保存在本浏览器。建房后在大厅选用，开局从候选词中不重复抽取起始词。</p>
+      <p class="hint">词包只保存在本浏览器。建房后在大厅选用，开局从候选词中不重复抽取起始词。点「分享」可生成分享码发给朋友，朋友凭码导入后建房时一样可选。</p>
     </header>
     <div class="row">
       <button id="btn-pack-new" class="primary">新建词包</button>
@@ -88,8 +88,23 @@
         <button id="btn-pack-cancel">取消</button>
       </div>
     </div>
+    <div class="card">
+      <h3>凭分享码导入</h3>
+      <p class="hint">朋友发来的 8 位分享码（形如 ABCD-EFGH），导入后词包存到本机，建房时与自建词包一样选择。</p>
+      <div class="row">
+        <input id="pack-import-code" maxlength="9" placeholder="输入分享码"
+          style="text-transform:uppercase;letter-spacing:2px;font-family:monospace">
+        <button id="btn-pack-import" class="primary">导入</button>
+      </div>
+      <p class="field-error" id="err-pack-import"></p>
+    </div>
     <ul id="pack-list" class="practice-list"></ul>
     <p id="pack-empty" class="hint hidden">还没有词包。点「新建词包」，为你的对局准备一个主题吧。</p>
+    <div id="shared-orphans" class="hidden">
+      <h3 class="shared-h-title">其他设备上分享的词包</h3>
+      <p class="hint">这些分享码来自同一身份（如另一台设备），本机词包已删除但分享仍对朋友有效，可在此取消。</p>
+      <ul id="shared-orphan-list" class="practice-list"></ul>
+    </div>
   </section>
 
   <!-- 战术练习：关卡列表 -->
@@ -375,6 +390,20 @@
   <div class="row"><button data-close class="primary">知道了</button></div>
 </dialog>
 
+<!-- 词包分享码 -->
+<dialog id="dlg-share">
+  <h3 id="share-title">分享词包</h3>
+  <p class="hint">把这串码发给朋友。他们在首页「我的词包 → 凭分享码导入」输入码即可导入，建房时与本机词包一样可选。</p>
+  <div id="share-code" class="share-code"></div>
+  <p id="share-updated-note" class="hint hidden">词包内容更新后再次分享会沿用此码，朋友导入的始终是最新内容。</p>
+  <div class="row">
+    <button id="btn-share-copy" class="primary">复制分享码</button>
+    <button id="btn-share-update">更新分享内容</button>
+    <button id="btn-share-cancel" class="danger-link">取消分享</button>
+    <button data-close>关闭</button>
+  </div>
+</dialog>
+
 <!-- 回放 -->
 <dialog id="dlg-replay">
   <h3>局面回放</h3>
@@ -404,6 +433,7 @@
 <script src="practice.js"></script>
 <script src="favorites.js"></script>
 <script src="packs.js"></script>
+<script src="shares.js"></script>
 <script src="client.js"></script>
 </body>
 </html>

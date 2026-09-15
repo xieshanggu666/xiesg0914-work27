@@ -19,6 +19,7 @@ function makeEl(id) {
     appendChild(c) { el.children.push(c); return c; },
     remove() {},
     focus() {},
+    select() {},
     get offsetWidth() { return 0; },
     closest() { return el; },
   };
@@ -34,30 +35,43 @@ function makeEl(id) {
 }
 
 const els = new Map();
-// 词包列表的操作按钮：桩不解析 DOM，从 innerHTML 中按 data-pack-edit/del 提取 id 并缓存按钮，
+// 词包列表的操作按钮：桩不解析 DOM，从 innerHTML 中按 data-* 属性提取 id 并缓存按钮，
 // 让 client 绑定的 onclick 与测试点击的是同一个对象
 const packBtns = new Map();
-function packListQuery(sel) {
-  const m = sel.match(/^\[data-pack-(edit|del)\]$/);
-  if (!m) return [];
-  const attr = m[1];
-  const ids = [...$('pack-list').innerHTML.matchAll(new RegExp(`data-pack-${attr}="([^"]+)"`, 'g'))]
-    .map(x => x[1]);
-  return ids.map(pid => {
-    const key = `${attr}:${pid}`;
-    if (!packBtns.has(key)) {
-      const btn = makeEl();
-      btn.dataset[attr === 'edit' ? 'packEdit' : 'packDel'] = pid;
-      packBtns.set(key, btn);
-    }
-    return packBtns.get(key);
-  });
+// data-pack-edit → dataset.packEdit；data-orphan-cancel → dataset.orphanCancel
+function datasetKey(attr) {
+  return attr.split('-').map((w, i) => i ? w[0].toUpperCase() + w.slice(1) : w).join('');
+}
+function dataListQuery(listId, attrs, innerHtml) {
+  return (sel) => {
+    const m = sel.match(/^\[data-([a-z-]+)\]$/);
+    if (!m || !attrs.includes(m[1])) return [];
+    const attr = m[1];
+    const ids = [...innerHtml().matchAll(new RegExp(`data-${attr}="([^"]+)"`, 'g'))]
+      .map(x => x[1]);
+    return ids.map(id => {
+      const key = `${listId}:${attr}:${id}`;
+      if (!packBtns.has(key)) {
+        const btn = makeEl();
+        btn.dataset[datasetKey(attr)] = id;
+        packBtns.set(key, btn);
+      }
+      return packBtns.get(key);
+    });
+  };
 }
 
 const $id = (id) => {
   if (!els.has(id)) {
     const el = makeEl(id);
-    if (id === 'pack-list') el.querySelectorAll = packListQuery;
+    if (id === 'pack-list') {
+      el.querySelectorAll = dataListQuery('pack-list',
+        ['pack-edit', 'pack-del', 'pack-share'], () => $('pack-list').innerHTML);
+    }
+    if (id === 'shared-orphan-list') {
+      el.querySelectorAll = dataListQuery('orphan',
+        ['orphan-copy', 'orphan-cancel'], () => $('shared-orphan-list').innerHTML);
+    }
     els.set(id, el);
   }
   return els.get(id);
@@ -68,6 +82,7 @@ global.document = {
   getElementById: $id,
   querySelectorAll: () => [],
   createElement: () => makeEl(),
+  body: makeEl('body'),
 };
 const storage = {};
 global.localStorage = {
@@ -77,6 +92,9 @@ global.localStorage = {
 };
 global.location = { protocol: 'http:', host: 'test', reload() {} };
 global.confirm = () => true;
+// 复制按钮走 execCommand 兜底（桩里没有 Clipboard API）
+global.navigator = {};
+global.execCommand = () => true;
 
 const sockets = [];
 const sentMsgs = [];
@@ -91,6 +109,7 @@ global.WTRules = require('../public/rules.js');
 global.WTPractice = require('../public/practice.js');
 global.WTFav = require('../public/favorites.js');
 global.WTPacks = require('../public/packs.js');
+global.WTShares = require('../public/shares.js');
 
 require('../public/client.js');
 
@@ -236,4 +255,153 @@ test('回归：已选用的词包被本机删除后，大厅下拉仍显示当�
   recvState({ wordPack: null });
   assert.strictEqual($('pack-select').value, '');
   assert.ok(!$('pack-select').innerHTML.includes('本机已删除'), '清除后合成选项消失');
+});
+
+// ---------- 词包分享码 ----------
+
+const storedShares = () => JSON.parse(storage.wt_pack_shares || '[]');
+// 模拟服务端推送一条消息给当前连接
+const recvMsg = (msg) => ws.onmessage({ data: JSON.stringify(msg) });
+// 创建一个测试用词包并返回它
+function createTestPack(name, words) {
+  $('btn-packs-home').onclick();
+  $('btn-pack-new').onclick();
+  $('pack-name').value = name;
+  $('pack-theme').value = '测试主题';
+  $('pack-words').value = words.join('\n');
+  $('btn-pack-save').onclick();
+  return storedPacks().find(p => p.name === name);
+}
+
+test('分享：发布词包收到码，本机映射落盘并展示分享码弹窗；再次点分享不重新发码', () => {
+  const pack = createTestPack('海洋分享包', ['海浪', '贝壳', '灯塔']);
+
+  // 首次点分享：发送 sharePack（带本机身份密钥与词包快照）
+  $('pack-list').querySelectorAll('[data-pack-share]')[0].onclick();
+  const m1 = sentMsgs.filter(m => m.type === 'sharePack');
+  assert.strictEqual(m1.length, 1, '发送 sharePack');
+  assert.strictEqual(m1[0].pack.id, pack.id);
+  assert.deepStrictEqual(m1[0].pack.words, ['海浪', '贝壳', '灯塔']);
+  assert.ok(/^[a-f0-9]{64}$/.test(m1[0].pidSecret), '随带本机身份密钥');
+
+  // 服务端回码：本机映射落盘、弹窗展示、列表出现分享徽标
+  recvMsg({ type: 'shared', code: 'ABCD-EFGH', packId: pack.id,
+    name: '海洋分享包', updatedAt: 1234, republished: false });
+  assert.strictEqual(storedShares().length, 1);
+  assert.strictEqual(storedShares()[0].code, 'ABCDEFGH', '码去短横后归一化存储');
+  assert.strictEqual(storedShares()[0].packId, pack.id);
+  assert.strictEqual($('dlg-share').open, true, '分享码弹窗打开');
+  assert.strictEqual($('share-code').textContent, 'ABCD-EFGH', '弹窗按 XXXX-XXXX 展示');
+  assert.ok($('pack-list').innerHTML.includes('ABCD-EFGH'), '列表内联展示分享码');
+
+  // 已分享的词包再点「分享码」：直接打开弹窗，不重复发布
+  $('dlg-share').close();
+  const before = sentMsgs.filter(m => m.type === 'sharePack').length;
+  $('pack-list').querySelectorAll('[data-pack-share]')[0].onclick();
+  assert.strictEqual($('dlg-share').open, true);
+  assert.strictEqual(sentMsgs.filter(m => m.type === 'sharePack').length, before, '沿用已有码不重发');
+
+  // 弹窗内「更新分享内容」：重新发布当前内容，服务端回 republished
+  $('btn-share-update').onclick();
+  const m2 = sentMsgs.filter(m => m.type === 'sharePack');
+  assert.strictEqual(m2.length, before + 1, '点更新后重新发布快照');
+  recvMsg({ type: 'shared', code: 'ABCDEFGH', packId: pack.id,
+    name: '海洋分享包', updatedAt: 5678, republished: true });
+  assert.strictEqual(storedShares().length, 1, '更新沿用原码，不产生新映射');
+  assert.strictEqual(storedShares()[0].updatedAt, 5678);
+});
+
+test('取消分享：作者确认后发 unsharePack，成功后码从本机清除、弹窗关闭', () => {
+  const pack = storedPacks().find(p => p.name === '海洋分享包');
+  assert.ok(pack);
+  // 从弹窗点取消分享（上一测试结束时弹窗被 republished 流程打开）
+  $('dlg-share').close();
+  $('pack-list').querySelectorAll('[data-pack-share]')[0].onclick();
+  $('btn-share-cancel').onclick();
+  const m = sentMsgs.filter(x => x.type === 'unsharePack');
+  assert.strictEqual(m.length, 1);
+  assert.strictEqual(m.at(-1).code, 'ABCDEFGH');
+  assert.ok(/^[a-f0-9]{64}$/.test(m.at(-1).pidSecret));
+  assert.strictEqual($('dlg-share').open, true, '服务端确认前弹窗仍打开');
+
+  recvMsg({ type: 'unshared', code: 'abcd-efgh' });
+  assert.strictEqual(storedShares().length, 0, '本机映射移除');
+  assert.strictEqual($('dlg-share').open, false, '弹窗关闭');
+  assert.ok(!$('pack-list').innerHTML.includes('ABCD-EFGH'), '列表徽标消失');
+});
+
+test('凭码导入：成功后词包进入本机列表并标记来源；重复导入不产生副本；坏码与失效码就地报错', () => {
+  $('btn-packs-home').onclick();
+  // 坏码（非 8 位）：不发送，就地提示
+  $('pack-import-code').value = 'ZZ';
+  $('btn-pack-import').onclick();
+  assert.match($('err-pack-import').textContent, /8 位/);
+  assert.ok(!sentMsgs.some(m => m.type === 'importShare'));
+
+  // 合法码：发送导入请求（归一化、去短横大写）
+  $('pack-import-code').value = 'kkkk-mnpq';
+  $('btn-pack-import').onclick();
+  const req = sentMsgs.filter(m => m.type === 'importShare');
+  assert.strictEqual(req.length, 1);
+  assert.strictEqual(req.at(-1).code, 'KKKKMNPQ');
+
+  // 服务端返回快照：词包导入本机、输入框清空
+  recvMsg({ type: 'sharedPack', code: 'KKKKMNPQ',
+    pack: { id: 'pk_friend_1', name: '朋友的词包', theme: '来自分享', words: ['山', '河', '湖'] } });
+  assert.strictEqual($('err-pack-import').textContent, '');
+  assert.strictEqual($('pack-import-code').value, '');
+  const imported = storedPacks().find(p => p.importedFrom === 'pk_friend_1');
+  assert.ok(imported, '导入的词包标记来源 packId');
+  assert.notStrictEqual(imported.id, 'pk_friend_1', '导入生成新的本机 id');
+  assert.deepStrictEqual(imported.words, ['山', '河', '湖']);
+  assert.ok($('pack-list').innerHTML.includes('朋友的词包'));
+
+  // 同一来源再导一次：不产生副本
+  $('pack-import-code').value = 'KKKKMNPQ';
+  $('btn-pack-import').onclick();
+  recvMsg({ type: 'sharedPack', code: 'KKKKMNPQ',
+    pack: { id: 'pk_friend_1', name: '朋友的词包', theme: '来自分享', words: ['山', '河', '湖'] } });
+  assert.strictEqual(storedPacks().filter(p => p.importedFrom === 'pk_friend_1').length, 1);
+
+  // 失效码：服务端错误就地显示，不新增词包
+  const beforeN = storedPacks().length;
+  $('pack-import-code').value = 'DEAD2345';
+  $('btn-pack-import').onclick();
+  recvMsg({ type: 'error', context: 'importShare', message: '分享码无效或已被作者取消' });
+  assert.match($('err-pack-import').textContent, /已被作者取消/);
+  assert.strictEqual(storedPacks().length, beforeN);
+});
+
+test('myShares 对账：其他设备上分享的码出现；本机包已删的码归入跨设备区并可取消', () => {
+  $('btn-packs-home').onclick();
+  // 服务端返回两条，两个 packId 在本机词包里都不存在 → 都进入跨设备区
+  recvMsg({ type: 'myShares', shares: [
+    { code: 'ZZZZ2345', packId: 'pk_dev2_a', name: '另一台设备的包', updatedAt: 100 },
+    { code: 'YYYY6789', packId: 'pk_dev2_b', name: '老设备遗留包', updatedAt: 50 },
+  ] });
+  assert.deepStrictEqual(storedShares().map(s => s.code), ['ZZZZ2345', 'YYYY6789']);
+  assert.ok(!$('shared-orphans')._cls.has('hidden'), '跨设备区显示');
+  assert.ok($('shared-orphan-list').innerHTML.includes('另一台设备的包'));
+  assert.ok($('shared-orphan-list').innerHTML.includes('老设备遗留包'));
+  assert.ok($('shared-orphan-list').innerHTML.includes('ZZZZ-2345'));
+
+  // 在跨设备区取消分享
+  $('shared-orphan-list').querySelectorAll('[data-orphan-cancel]')[0].onclick();
+  const m = sentMsgs.filter(x => x.type === 'unsharePack');
+  assert.strictEqual(m.at(-1).code, 'ZZZZ2345');
+  recvMsg({ type: 'unshared', code: 'ZZZZ2345' });
+  assert.ok(!$('shared-orphan-list').innerHTML.includes('另一台设备的包'));
+  assert.ok($('shared-orphan-list').innerHTML.includes('老设备遗留包'));
+
+  // 下次对账时服务端列表只剩一条：本机多余映射被清掉
+  recvMsg({ type: 'myShares', shares: [
+    { code: 'YYYY6789', packId: 'pk_dev2_b', name: '老设备遗留包', updatedAt: 50 },
+  ] });
+  assert.deepStrictEqual(storedShares().map(s => s.code), ['YYYY6789']);
+});
+
+test('进入词包页即向服务端拉取我的分享列表', () => {
+  const before = sentMsgs.filter(m => m.type === 'myShares').length;
+  $('btn-packs-home').onclick();
+  assert.strictEqual(sentMsgs.filter(m => m.type === 'myShares').length, before + 1);
 });
